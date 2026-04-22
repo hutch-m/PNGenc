@@ -442,9 +442,9 @@ int PNG_addRGB565Line(PNGENCIMAGE *pImage, uint16_t *pRGB565, void *pTempLine, i
                 if (bBigEndian) {
                     us = __builtin_bswap16(us);
                 }
-                *d++ = (uint8_t)(((us >> 8) & 0xf8) | (us >> 13)); // red
-                *d++ = (uint8_t)(((us >> 3) & 0xfc) | ((us >> 9) & 0x3)); // green
-                *d++ = (uint8_t)(((us & 0x1f) << 3) | ((us & 0x1c) >> 2)); // blue
+                *d++ = (uint8_t)(((us >> 11) & 0x1f) << 3); // red
+                *d++ = (uint8_t)(((us >> 5) & 0x3f) << 2); // green
+                *d++ = (uint8_t)((us & 0x1f) << 3); // blue
             }
             break;
         case PNG_PIXEL_GRAYSCALE:
@@ -454,9 +454,9 @@ int PNG_addRGB565Line(PNGENCIMAGE *pImage, uint16_t *pRGB565, void *pTempLine, i
                 if (bBigEndian) {
                     us = __builtin_bswap16(us);
                 }
-                r = (uint8_t)(((us >> 8) & 0xf8) | (us >> 13)); // red
-                g = (uint8_t)(((us >> 3) & 0xfc) | ((us >> 9) & 0x3)); // green
-                b = (uint8_t)(((us & 0x1f) << 3) | ((us & 0x1c) >> 2)); // blue
+                r = (uint8_t)(((us >> 11) & 0x1f) << 3); // red
+                g = (uint8_t)(((us >> 5) & 0x3f) << 2); // green
+                b = (uint8_t)((us & 0x1f) << 3); // blue
                 *d++ = (uint8_t)((r + g*2 + b)>>2);
             }
             break;
