@@ -1,4 +1,4 @@
-//
+ //
 // PNG Encoder
 //
 // written by Larry Bank
@@ -177,9 +177,8 @@ int PNG_openRAM(PNGENCIMAGE *pPNG, uint8_t *pData, int iDataSize);
 int PNG_openFile(PNGENCIMAGE *pPNG, const char *szFilename, PNGENC_OPEN_CALLBACK *pfnOpen, PNGENC_CLOSE_CALLBACK *pfnClose, PNGENC_READ_CALLBACK *pfnRead, PNGENC_WRITE_CALLBACK *pfnWrite, PNGENC_SEEK_CALLBACK *pfnSeek);
 int PNG_close(PNGENCIMAGE *pPNG);
 int PNG_encodeBegin(PNGENCIMAGE *pPNG, int iWidth, int iHeight, uint8_t ucPixelType, uint8_t ucBpp, uint8_t *pPalette, uint8_t ucCompLevel);
-void PNG_encodeEnd(PNGENCIMAGE *pPNG);
-int PNG_addLine(PNGIMAGE *, uint8_t *pPixels, int y);
-int PNG_addRGB565Line(PNGENCIMAGE *, uint16_t *pPixels, void *pTempLine, int y);
+int PNG_addLine(PNGENCIMAGE *pPNG, uint8_t *pPixels, int y);
+int PNG_addRGB565Line(PNGENCIMAGE *pPNG, uint16_t *pPixels, void *pTempLine, int y, int bBigEndian);
 int PNG_setTransparentColor(PNGENCIMAGE *pPNG, uint32_t u32Color);
 int PNG_setAlphaPalette(PNGENCIMAGE *pPNG, uint8_t *pPalette);
 int PNG_getLastError(PNGENCIMAGE *pPNG);

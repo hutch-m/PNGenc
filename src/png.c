@@ -9,6 +9,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include "zlib.h"
+#define __MACH__
+#include "PNGenc.h"
 
 // Macro to simplify writing a big-endian 32-bit value on any CPU
 #define WRITEMOTO32(p, o, val) {uint32_t l = val; p[o] = (unsigned char)(l >> 24); p[o+1] = (unsigned char)(l >> 16); p[o+2] = (unsigned char)(l >> 8); p[o+3] = (unsigned char)l;}
@@ -294,7 +296,7 @@ int PNG_encodeBegin(PNGENCIMAGE *pPNG, int iWidth, int iHeight, uint8_t ucPixelT
     return PNG_SUCCESS;
 } /* PNG_encodeBegin() */
 
-int PNG_addLine(PNGENCIMAGE *pImage, uint8_t *pSrc, int y)
+int PNG_addLine(PNGENCIMAGE *pImage, uint8_t *pPixels, int y)
 {
     unsigned char ucFilter; // filter type
     unsigned char *pOut;
@@ -317,11 +319,11 @@ int PNG_addLine(PNGENCIMAGE *pImage, uint8_t *pSrc, int y)
         iStride = 1; // 1,4 bpp
         ucFilter = 0; // filtering doesn't seem to improve low color images
     } else {
-        ucFilter = PNGFindFilter(pSrc, (y == 0) ? NULL : pImage->ucPrevLine, iPitch, iStride); // find best filter
+        ucFilter = PNGFindFilter(pPixels, (y == 0) ? NULL : pImage->ucPrevLine, iPitch, iStride); // find best filter
     }
     *pOut++ = ucFilter; // store filter byte
-    PNGFilter(ucFilter, pOut, pSrc, pImage->ucPrevLine, iStride, iPitch); // filter the current line of image data and store
-    memcpy(pImage->ucPrevLine, pSrc, iPitch);
+    PNGFilter(ucFilter, pOut, pPixels, pImage->ucPrevLine, iStride, iPitch); // filter the current line of image data and store
+    memcpy(pImage->ucPrevLine, pPixels, iPitch);
     // Compress the filtered image data
     if (y == 0) // first block, initialize zlib
     {
@@ -746,3 +748,31 @@ int PNG_close(PNGENCIMAGE *pPNG)
         (*pPNG->pfnClose)(&pPNG->PNGFile);
     return pPNG->iDataSize;
 } /* PNG_close() */
+
+//
+// return the last error (if any)
+//
+int PNG_getLastError(PNGENCIMAGE *pPNG)
+{
+    return pPNG->iError;
+} /* getLastError() */
+
+int PNG_setTransparentColor(PNGENCIMAGE *pPNG, uint32_t u32Color)
+{
+    if (pPNG->ucPixelType == PNG_PIXEL_GRAYSCALE || pPNG->ucPixelType == PNG_PIXEL_TRUECOLOR) {
+        pPNG->iTransparent = u32Color;
+        return PNG_SUCCESS;
+    }
+    else
+        return PNG_INVALID_PARAMETER; // indexed image must have palette alpha values
+} /* setTransparentColor() */
+
+int PNG_setAlphaPalette(PNGENCIMAGE *pPNG, uint8_t *pPalette)
+{
+    if (pPalette != NULL && pPNG->ucPixelType == PNG_PIXEL_INDEXED) {
+        pPNG->ucHasAlphaPalette = 1;
+        memcpy(&pPNG->ucPalette[768], pPalette, 256); // capture up to 256 alpha values
+        return PNG_SUCCESS;
+    }
+    return PNG_INVALID_PARAMETER;
+} /* setAlphaPalette() */
