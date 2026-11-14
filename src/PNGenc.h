@@ -152,6 +152,28 @@ typedef struct pngenc_image_tag
     uint8_t ucFileBuf[PNG_FILE_BUF_SIZE]; // holds temp file data
 } PNGENCIMAGE;
 
+static inline unsigned PNG_clampYUVChannel(int scaled)
+{
+    if (scaled <= 0)
+        return 0;
+    if (scaled >= 255 * 256)
+        return 255;
+    return (unsigned)(scaled + 128) >> 8;
+}
+
+// Convert one pixel to RGB888 using full-range BT.601.
+// Each pair of input words is 0xYYUU, 0xYYVV, with shared U and V.
+static inline void PNG_yuyvToRGB888(const uint16_t *pYUYV, unsigned x, uint8_t rgb[3])
+{
+    unsigned pair = x & ~1u;
+    int u = (pYUYV[pair] & 0xff) - 128;
+    int v = (pYUYV[pair + 1] & 0xff) - 128;
+    int luma = (pYUYV[x] >> 8) * 256;
+    rgb[0] = PNG_clampYUVChannel(luma + 359 * v);
+    rgb[1] = PNG_clampYUVChannel(luma - 88 * u - 183 * v);
+    rgb[2] = PNG_clampYUVChannel(luma + 454 * u);
+}
+
 #ifdef __cplusplus
 #define PNG_STATIC static
 //
@@ -181,6 +203,9 @@ int PNG_close(PNGENCIMAGE *pPNG);
 int PNG_encodeBegin(PNGENCIMAGE *pPNG, int iWidth, int iHeight, uint8_t ucPixelType, uint8_t ucBpp, uint8_t *pPalette, uint8_t ucCompLevel);
 int PNG_addLine(PNGENCIMAGE *pPNG, uint8_t *pPixels, int y);
 int PNG_addRGB565Line(PNGENCIMAGE *pPNG, uint16_t *pPixels, void *pTempLine, int y, int bBigEndian);
+// Even-width YUYV rows packed as 0xYYUU, 0xYYVV word pairs. Writes 24-bit
+// truecolor. pTempLine needs 3 bytes per pixel.
+int PNG_addYUYVLine(PNGENCIMAGE *pPNG, const uint16_t *pYUYV, uint8_t *pTempLine, int y);
 int PNG_setTransparentColor(PNGENCIMAGE *pPNG, uint32_t u32Color);
 int PNG_setAlphaPalette(PNGENCIMAGE *pPNG, uint8_t *pPalette);
 int PNG_getLastError(PNGENCIMAGE *pPNG);

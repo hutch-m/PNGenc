@@ -459,6 +459,25 @@ int PNG_addRGB565Line(PNGENCIMAGE *pImage, uint16_t *pRGB565, void *pTempLine, i
     return PNG_addLine(pImage, (uint8_t *)pTempLine, y);
 } /* PNG_addRGB565Line() */
 
+int PNG_addYUYVLine(PNGENCIMAGE *pImage, const uint16_t *pYUYV, uint8_t *pTempLine, int y)
+{
+    if (pImage->iError != PNG_SUCCESS)
+        return pImage->iError;
+    if (!pYUYV || !pTempLine || pImage->ucPixelType != PNG_PIXEL_TRUECOLOR ||
+        pImage->ucBpp != 24 || pImage->iWidth <= 0 || (pImage->iWidth & 1)) {
+        pImage->iError = PNG_INVALID_PARAMETER;
+        return pImage->iError;
+    }
+    if (pImage->iWidth > ((int)sizeof(pImage->ucCurrLine) - 1) / 3) {
+        pImage->iError = PNG_TOO_BIG;
+        return pImage->iError;
+    }
+
+    for (int x = 0; x < pImage->iWidth; x++)
+        PNG_yuyvToRGB888(pYUYV, x, pTempLine + 3 * x);
+    return PNG_addLine(pImage, pTempLine, y);
+} /* PNG_addYUYVLine() */
+
 //
 // Find the best filter method for the given scanline
 // Try each filter algorithm in turn and use SAD (sum of absolute differences)
