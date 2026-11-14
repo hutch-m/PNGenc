@@ -100,7 +100,8 @@ enum {
     PNG_UNSUPPORTED_FEATURE,
     PNG_INVALID_FILE,
     PNG_TOO_BIG,
-    PNG_NOT_INITIALIZED
+    PNG_NOT_INITIALIZED,
+    PNG_FILE_ERROR
 };
 
 typedef struct png_file_tag
@@ -113,7 +114,8 @@ typedef struct png_file_tag
 
 #endif // !__PNGDEC__
 
-// Callback function prototypes
+// Read and write return the byte count. Seek returns the resulting position.
+// A negative return value indicates failure.
 typedef int32_t (PNGENC_READ_CALLBACK)(PNGFILE *pFile, uint8_t *pBuf, int32_t iLen);
 typedef int32_t (PNGENC_WRITE_CALLBACK)(PNGFILE *pFile, uint8_t *pBuf, int32_t iLen);
 typedef int32_t (PNGENC_SEEK_CALLBACK)(PNGFILE *pFile, int32_t iPosition);

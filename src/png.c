@@ -95,7 +95,6 @@ static unsigned char PAETH(unsigned char a, unsigned char b, unsigned char c)
 //
 static int PNGStartFile(PNGENCIMAGE *pImage)
 {
-    int iError = PNG_SUCCESS;
     unsigned char *p;
     int iSize, i, iLen;
     uint32_t ulCRC;
@@ -191,11 +190,14 @@ static int PNGStartFile(PNGENCIMAGE *pImage)
     pImage->iCompressedSize = 0;
     pImage->iHeaderSize = iSize; // keep the PNG header size for later
     if (pImage->pOutput) { // copy to ram?
+        if (iSize > pImage->iBufferSize)
+            return PNG_MEM_ERROR;
         memcpy(pImage->pOutput, pImage->ucFileBuf, iSize);
     } else { // write it to the file
-        (*pImage->pfnWrite)(&pImage->PNGFile, pImage->ucFileBuf, iSize);
+        if (pImage->pfnWrite(&pImage->PNGFile, pImage->ucFileBuf, iSize) != iSize)
+            return PNG_FILE_ERROR;
     }
-    return iError;
+    return PNG_SUCCESS;
     
 } /* PNGStartFile() */
 //
@@ -210,6 +212,8 @@ int PNGEndFile(PNGENCIMAGE *pImage)
     if (pImage->pOutput) { // output buffer = easy to wrap up
         p = pImage->pOutput;
         iSize = pImage->iHeaderSize;
+        if (pImage->iBufferSize - iSize - pImage->iCompressedSize < 16)
+            return -PNG_MEM_ERROR;
         WRITEMOTO32(p, iSize-8, pImage->iCompressedSize); // write IDAT chunk size
         iSize += pImage->iCompressedSize;
         ulCRC = PNGCalcCRC(&p[iSize-pImage->iCompressedSize-4], pImage->iCompressedSize+4, 0xffffffff); // store CRC for IDAT chunk
@@ -231,9 +235,11 @@ int PNGEndFile(PNGENCIMAGE *pImage)
         p = (uint8_t *)&pu32[0];
         iSize = pImage->iHeaderSize;
         ulCRC = 0xffffffff;
-        (*pImage->pfnSeek)(&pImage->PNGFile, iSize-8); // seek to compressed size
+        if (pImage->pfnSeek(&pImage->PNGFile, iSize-8) != iSize-8)
+            return -PNG_FILE_ERROR;
         WRITEMOTO32(p, 0, pImage->iCompressedSize); // save the actual IDAT size
-        (*pImage->pfnWrite)(&pImage->PNGFile, (uint8_t *)pu32, 4);
+        if (pImage->pfnWrite(&pImage->PNGFile, p, 4) != 4)
+            return -PNG_FILE_ERROR;
         // From this point forward, we need to calculate the CRC of the IDAT chunk
         // and unfortunately that means reading back all of the compressed data
         i = pImage->iCompressedSize+4; // IDAT marker + data length
@@ -241,7 +247,8 @@ int PNGEndFile(PNGENCIMAGE *pImage)
             iReadSize = i;
             if (iReadSize > PNG_FILE_BUF_SIZE)
                 iReadSize = PNG_FILE_BUF_SIZE;
-            (*pImage->pfnRead)(&pImage->PNGFile, pImage->ucFileBuf, iReadSize);
+            if (pImage->pfnRead(&pImage->PNGFile, pImage->ucFileBuf, iReadSize) != iReadSize)
+                return -PNG_FILE_ERROR;
             ulCRC = PNGCalcCRC(pImage->ucFileBuf, iReadSize, ulCRC);
             i -= iReadSize;
         }
@@ -256,7 +263,8 @@ int PNGEndFile(PNGENCIMAGE *pImage)
         WRITEMOTO32(p, 12, 0xae426082); // same CRC every time
         iSize += 4;
         // write the final data to the file
-        (*pImage->pfnWrite)(&pImage->PNGFile, (uint8_t *)p, 16);
+        if (pImage->pfnWrite(&pImage->PNGFile, p, 16) != 16)
+            return -PNG_FILE_ERROR;
     }
     return iSize;
 } /* PNGEndFile() */
@@ -278,11 +286,6 @@ void ZLIB_INTERNAL myfree (voidpf opaque, voidpf ptr)
     (void)opaque;
     (void)ptr; // doesn't do anything since the memory is from an internal pool
 } /* myfree() */
-//
-// Compress one line of image at a time and write the compressed data
-// incrementally to the output file. This allows the system to not need an
-// input nor output buffer larger than 2 lines of image data
-//
 int PNG_encodeBegin(PNGENCIMAGE *pPNG, int iWidth, int iHeight, uint8_t ucPixelType, uint8_t ucBpp, uint8_t *pPalette, uint8_t ucCompLevel)
 {
     pPNG->iWidth = iWidth;
@@ -296,142 +299,130 @@ int PNG_encodeBegin(PNGENCIMAGE *pPNG, int iWidth, int iHeight, uint8_t ucPixelT
     return PNG_SUCCESS;
 } /* PNG_encodeBegin() */
 
+static int PNGFlushOutput(PNGENCIMAGE *image)
+{
+    z_stream *stream = &image->c_stream;
+    int size = PNG_FILE_BUF_SIZE - (int)stream->avail_out;
+
+    if (size == 0)
+        return PNG_SUCCESS;
+    if (image->pOutput) {
+        int offset = image->iHeaderSize + image->iCompressedSize;
+        if (size > image->iBufferSize - offset)
+            return PNG_MEM_ERROR;
+        memcpy(image->pOutput + offset, image->ucFileBuf, size);
+    } else if (image->pfnWrite(&image->PNGFile, image->ucFileBuf, size) != size) {
+        return PNG_FILE_ERROR;
+    }
+    image->iCompressedSize += size;
+    // Reset the zlib output buffer to start.
+    stream->next_out = image->ucFileBuf;
+    stream->avail_out = PNG_FILE_BUF_SIZE;
+    return PNG_SUCCESS;
+}
+
+//
+// Compress one line of image at a time and write the compressed data
+// incrementally to the output file. Only the current and previous scanlines
+// and a fixed-size compressed data buffer are needed in file mode.
+//
 int PNG_addLine(PNGENCIMAGE *pImage, uint8_t *pPixels, int y)
 {
-    unsigned char ucFilter; // filter type
-    unsigned char *pOut;
-    int iStride;
-    int err;
-    int iPitch;
-    
-    iStride = pImage->ucBpp >> 3; // bytes per pixel
-    if (pImage->ucBpp == 1) {
-        iPitch = (pImage->iWidth + 7)/8;
-    } else if (pImage->ucBpp == 2) {
-        iPitch = (pImage->iWidth + 3)/4;
-    } else if (pImage->ucBpp == 4) {
-        iPitch = (pImage->iWidth + 1)/2;
-    } else {
-        iPitch = (pImage->iWidth * pImage->ucBpp) >> 3;
+    z_stream *stream = &pImage->c_stream;
+    int iStride = pImage->ucBpp >> 3; // bytes per pixel
+    int iPitch = (pImage->iWidth * pImage->ucBpp + 7) >> 3;
+    int rc = PNG_SUCCESS;
+
+    if (pImage->iError != PNG_SUCCESS)
+        return pImage->iError;
+    if (iPitch < 1 || iPitch >= (int)sizeof(pImage->ucCurrLine)) {
+        pImage->iError = PNG_TOO_BIG;
+        return pImage->iError;
     }
-    pOut = pImage->ucCurrLine;
-    if (iStride < 1) {
-        iStride = 1; // 1,4 bpp
-        ucFilter = 0; // filtering doesn't seem to improve low color images
-    } else {
+
+    unsigned char ucFilter = PNG_FILTER_NONE; // filtering doesn't seem to improve low color images
+    if (iStride != 0)
         ucFilter = PNGFindFilter(pPixels, (y == 0) ? NULL : pImage->ucPrevLine, iPitch, iStride); // find best filter
-    }
-    *pOut++ = ucFilter; // store filter byte
-    PNGFilter(ucFilter, pOut, pPixels, pImage->ucPrevLine, iStride, iPitch); // filter the current line of image data and store
+    pImage->ucCurrLine[0] = ucFilter; // store filter byte
+    PNGFilter(ucFilter, pImage->ucCurrLine + 1, pPixels, pImage->ucPrevLine, iStride, iPitch); // filter and store the current line
     memcpy(pImage->ucPrevLine, pPixels, iPitch);
+
     // Compress the filtered image data
-    if (y == 0) // first block, initialize zlib
-    {
-        PNGStartFile(pImage);
-        memset(&pImage->c_stream, 0, sizeof(z_stream));
-        pImage->c_stream.zalloc = myalloc; // use internal alloc/free
-        pImage->c_stream.zfree = myfree; // to use our memory pool
-        pImage->c_stream.opaque = (voidpf)pImage;
+    if (y == 0) { // first block, initialize zlib
+        rc = PNGStartFile(pImage);
+        if (rc != PNG_SUCCESS) {
+            pImage->iError = rc;
+            return rc;
+        }
+        memset(stream, 0, sizeof(*stream));
+        stream->zalloc = myalloc; // use internal alloc/free
+        stream->zfree = myfree;
+        stream->opaque = pImage;
         pImage->iMemPool = 0;
         // ZLIB compression levels: 1 = fastest, 9 = most compressed (slowest)
-//        err = deflateInit(&pImage->c_stream, pImage->ucCompLevel); // might as well use max compression
-        err = deflateInit2_(&pImage->c_stream, pImage->ucCompLevel, Z_DEFLATED, MAX_WBITS-MEM_SHRINK, DEF_MEM_LEVEL-MEM_SHRINK, Z_DEFAULT_STRATEGY, ZLIB_VERSION, (int)sizeof(z_stream)); // might as well use max compression
-        pImage->c_stream.total_out = 0;
-        pImage->c_stream.total_in = 0;
-        pImage->c_stream.next_out = pImage->ucFileBuf;
-        pImage->c_stream.avail_out = PNG_FILE_BUF_SIZE;
-    }
-    pImage->c_stream.next_in  = (Bytef*)pImage->ucCurrLine;
-    pImage->c_stream.avail_in = iPitch+1; // compress entire buffer in 1 shot
-    err = deflate(&pImage->c_stream, Z_NO_FLUSH); // Z_FULL_FLUSH);
-    if (err != Z_OK) { // something went wrong with the data compression, stop
-        pImage->iError = PNG_ENCODE_ERROR;
-        return PNG_ENCODE_ERROR;
-    }
-    if (y == pImage->iHeight - 1) // last line, clean up
-    {
-        err = deflate(&pImage->c_stream, Z_FULL_FLUSH);
-        err = deflate(&pImage->c_stream, Z_FINISH); // flush any remaining output
-        while(err == Z_OK || err == Z_BUF_ERROR) { // more data than will fit
-            if (pImage->pOutput) { // memory
-                if ((pImage->iHeaderSize + pImage->iCompressedSize + pImage->c_stream.total_out) > pImage->iBufferSize) {
-                    // output buffer not large enough
-                    pImage->iError = PNG_MEM_ERROR;
-                    return PNG_MEM_ERROR;
-                }
-                memcpy(&pImage->pOutput[pImage->iHeaderSize + pImage->iCompressedSize], pImage->ucFileBuf, pImage->c_stream.total_out);
-            } else { // file
-                (*pImage->pfnWrite)(&pImage->PNGFile, pImage->ucFileBuf, (int)pImage->c_stream.total_out);
-            }
-            pImage->iCompressedSize += (int)pImage->c_stream.total_out;
-            // reset zlib output buffer to start
-            pImage->c_stream.total_out = 0;
-            pImage->c_stream.next_out = pImage->ucFileBuf;
-            pImage->c_stream.avail_out = PNG_FILE_BUF_SIZE;
-            err = deflate(&pImage->c_stream, Z_FINISH);
+        if (deflateInit2(stream, pImage->ucCompLevel, Z_DEFLATED,
+                         MAX_WBITS-MEM_SHRINK, DEF_MEM_LEVEL-MEM_SHRINK,
+                         Z_DEFAULT_STRATEGY) != Z_OK) {
+            pImage->iError = PNG_ENCODE_ERROR;
+            return pImage->iError;
         }
-        err = deflateEnd(&pImage->c_stream);
-        if (pImage->c_stream.total_out) { // the last bytes of the compressed data stream
-            if (pImage->pOutput) { // memory
-                if ((pImage->iHeaderSize + pImage->iCompressedSize + pImage->c_stream.total_out) > pImage->iBufferSize) {
-                    // output buffer not large enough
-                    pImage->iError = PNG_MEM_ERROR;
-                    return PNG_MEM_ERROR;
-                }
-                memcpy(&pImage->pOutput[pImage->iHeaderSize + pImage->iCompressedSize], pImage->ucFileBuf, pImage->c_stream.total_out);
-            } else { // file
-                (*pImage->pfnWrite)(&pImage->PNGFile, pImage->ucFileBuf, (int)pImage->c_stream.total_out);
+        stream->next_out = pImage->ucFileBuf;
+        stream->avail_out = PNG_FILE_BUF_SIZE;
+    }
+
+    stream->next_in = pImage->ucCurrLine;
+    stream->avail_in = iPitch + 1;
+    // Each compressed scanline might generate only a few bytes. Let those
+    // bytes accumulate before writing to memory or file to avoid small writes.
+    // Drain the current row before replacing the input buffer.
+    int err;
+    do {
+        err = deflate(stream, Z_NO_FLUSH);
+        if (err != Z_OK) {
+            rc = PNG_ENCODE_ERROR;
+            break;
+        }
+        if (PNG_FILE_BUF_SIZE - stream->avail_out >= PNG_FILE_HIGHWATER)
+            rc = PNGFlushOutput(pImage);
+    } while (rc == PNG_SUCCESS && stream->avail_in != 0);
+
+    if (rc == PNG_SUCCESS && y == pImage->iHeight - 1) { // last line, finish file
+        int flush = Z_FULL_FLUSH;
+        // Drain all remaining output, including the zlib checksum, before ending IDAT.
+        do {
+            err = deflate(stream, flush);
+            if (err != Z_OK && err != Z_STREAM_END) {
+                rc = PNG_ENCODE_ERROR;
+                break;
             }
-            pImage->iCompressedSize += (int)pImage->c_stream.total_out;
-            pImage->c_stream.total_out = 0;
+            int output_full = stream->avail_out == 0;
+            if (output_full || err == Z_STREAM_END)
+                rc = PNGFlushOutput(pImage);
+            if (flush == Z_FULL_FLUSH && !output_full)
+                flush = Z_FINISH;
+        } while (rc == PNG_SUCCESS && err != Z_STREAM_END);
+        if (rc == PNG_SUCCESS) {
+            int size = PNGEndFile(pImage);
+            if (size < 0)
+                rc = -size;
+            else
+                pImage->iDataSize = size;
         }
     }
-    // Write the data to memory or a file
-    //
-    // A bunch of extra logic has been added below to minimize the total number
-    // of calls to 'write'. Each compressed scanline might generate only a few
-    // bytes of flate output and calling write() for a few bytes at a time can
-    // slow things to a crawl.
-    while (pImage->c_stream.total_out >= PNG_FILE_HIGHWATER || pImage->c_stream.avail_in != 0) {
-        if (pImage->pOutput) { // memory
-            if ((pImage->iHeaderSize + pImage->iCompressedSize + pImage->c_stream.total_out) > pImage->iBufferSize) {
-                // output buffer not large enough
-                pImage->iError = PNG_MEM_ERROR;
-                return PNG_MEM_ERROR;
-            }
-            memcpy(&pImage->pOutput[pImage->iHeaderSize + pImage->iCompressedSize], pImage->ucFileBuf, pImage->c_stream.total_out);
-        } else { // file
-            (*pImage->pfnWrite)(&pImage->PNGFile, pImage->ucFileBuf, (int)pImage->c_stream.total_out);
-        }
-        pImage->iCompressedSize += (int)pImage->c_stream.total_out;
-        // reset zlib output buffer to start
-        pImage->c_stream.total_out = 0;
-        pImage->c_stream.next_out = pImage->ucFileBuf;
-        pImage->c_stream.avail_out = PNG_FILE_BUF_SIZE;
-        if (pImage->c_stream.avail_in != 0) { // left over data that it didn't have room to compress
-            err = deflate(&pImage->c_stream, Z_NO_FLUSH);
-        }
-    } // highwater hit
-    if (y == pImage->iHeight -1) { // last line, finish file
-        pImage->iDataSize = PNGEndFile(pImage);
-    }    
-    return PNG_SUCCESS; // DEBUG
-    
+
+    if (rc != PNG_SUCCESS || y == pImage->iHeight - 1)
+        deflateEnd(stream);
+    pImage->iError = rc;
+    return rc;
 } /* PNG_addLine() */
+
 //
-// Compress one line image at a time and write the compressed data
-// incrementally to the output file. This allows the system to not need an
-// input nor output buffer larger than 2 lines of image data
 // The input pixels are RGB565 (not supported by PNG) and are converted into the
-// format requested by the iPixelType param in the call to encodeBegin()
+// format requested by the iPixelType param in the call to encodeBegin().
+// Then PNG_addLine compresses and writes the converted row incrementally.
 //
 int PNG_addRGB565Line(PNGENCIMAGE *pImage, uint16_t *pRGB565, void *pTempLine, int y, int bBigEndian)
 {
-    unsigned char ucFilter; // filter type
-    unsigned char *pOut, *pSrc;
-    int iStride;
-    int err;
-    int iPitch;
     uint16_t us, *s = pRGB565;
     uint8_t *d = (uint8_t *)pTempLine;
 
@@ -465,87 +456,7 @@ int PNG_addRGB565Line(PNGENCIMAGE *pImage, uint16_t *pRGB565, void *pTempLine, i
             pImage->iError = PNG_INVALID_PARAMETER;
             return PNG_INVALID_PARAMETER;
     }
-    pSrc = (uint8_t *)pTempLine;
-    iStride = pImage->ucBpp >> 3; // bytes per pixel
-    iPitch = (pImage->iWidth * pImage->ucBpp) >> 3;
-    if (iStride < 1)
-        iStride = 1; // 1,4 bpp
-    pOut = pImage->ucCurrLine;
-    ucFilter = PNGFindFilter(pSrc, (y == 0) ? NULL : pImage->ucPrevLine, iPitch, iStride); // find best filter
-    *pOut++ = ucFilter; // store filter byte
-    PNGFilter(ucFilter, pOut, pSrc, pImage->ucPrevLine, iStride, iPitch); // filter the current line of image data and store
-    memcpy(pImage->ucPrevLine, pSrc, iPitch);
-    // Compress the filtered image data
-    if (y == 0) // first block, initialize zlib
-    {
-        PNGStartFile(pImage);
-        memset(&pImage->c_stream, 0, sizeof(z_stream));
-        pImage->c_stream.zalloc = myalloc; // use internal alloc/free
-        pImage->c_stream.zfree = myfree; // to use our memory pool
-        pImage->c_stream.opaque = (voidpf)pImage;
-        pImage->iMemPool = 0;
-        // ZLIB compression levels: 1 = fastest, 9 = most compressed (slowest)
-//        err = deflateInit(&pImage->c_stream, pImage->ucCompLevel); // might as well use max compression
-        err = deflateInit2_(&pImage->c_stream, pImage->ucCompLevel, Z_DEFLATED, MAX_WBITS-MEM_SHRINK, DEF_MEM_LEVEL-MEM_SHRINK, Z_DEFAULT_STRATEGY, ZLIB_VERSION, (int)sizeof(z_stream)); // might as well use max compression
-        pImage->c_stream.total_out = 0;
-        pImage->c_stream.next_out = pImage->ucFileBuf;
-        pImage->c_stream.avail_out = PNG_FILE_BUF_SIZE;
-    }
-    pImage->c_stream.next_in  = (Bytef*)pImage->ucCurrLine;
-    pImage->c_stream.total_in = 0;
-    pImage->c_stream.avail_in = iPitch+1; // compress entire buffer in 1 shot
-    err = deflate(&pImage->c_stream, Z_PARTIAL_FLUSH); // Z_SYNC_FLUSH);
-    if (err != Z_OK) { // something went wrong with the data compression, stop
-        pImage->iError = PNG_ENCODE_ERROR;
-        return PNG_ENCODE_ERROR;
-    }
-    if (y == pImage->iHeight - 1) // last line, clean up
-    {
-        err = deflate(&pImage->c_stream, Z_FINISH);
-        err = deflateEnd(&pImage->c_stream);
-    }
-    // Write the data to memory or a file
-    //
-    // A bunch of extra logic has been added below to minimize the total number
-    // of calls to 'write'. Each compressed scanline might generate only a few
-    // bytes of flate output and calling write() for a few bytes at a time can
-    // slow things to a crawl.
-    if (pImage->c_stream.total_out >= PNG_FILE_HIGHWATER) {
-        if (pImage->pOutput) { // memory
-            if ((pImage->iHeaderSize + pImage->iCompressedSize + pImage->c_stream.total_out) > pImage->iBufferSize) {
-                // output buffer not large enough
-                pImage->iError = PNG_MEM_ERROR;
-                return PNG_MEM_ERROR;
-            }
-            memcpy(&pImage->pOutput[pImage->iHeaderSize + pImage->iCompressedSize], pImage->ucFileBuf, pImage->c_stream.total_out);
-        } else { // file
-            (*pImage->pfnWrite)(&pImage->PNGFile, pImage->ucFileBuf, (int)pImage->c_stream.total_out);
-        }
-        pImage->iCompressedSize += (int)pImage->c_stream.total_out;
-        // reset zlib output buffer to start
-        pImage->c_stream.total_out = 0;
-        pImage->c_stream.next_out = pImage->ucFileBuf;
-        pImage->c_stream.avail_out = PNG_FILE_BUF_SIZE;
-    } // highwater hit
-    if (y == pImage->iHeight -1) { // last line, finish file
-        // if any remaining data in output buffer, write it
-        if (pImage->c_stream.total_out > 0) {
-            if (pImage->pOutput) { // memory
-                if ((pImage->iHeaderSize + pImage->iCompressedSize + pImage->c_stream.total_out) > pImage->iBufferSize) {
-                    // output buffer not large enough
-                    pImage->iError = PNG_MEM_ERROR;
-                    return PNG_MEM_ERROR;
-                }
-                memcpy(&pImage->pOutput[pImage->iHeaderSize + pImage->iCompressedSize], pImage->ucFileBuf, pImage->c_stream.total_out);
-            } else { // file
-                (*pImage->pfnWrite)(&pImage->PNGFile, pImage->ucFileBuf, (int)pImage->c_stream.total_out);
-            }
-            pImage->iCompressedSize += (int)pImage->c_stream.total_out;
-        }
-        pImage->iDataSize = PNGEndFile(pImage);
-    }
-    return PNG_SUCCESS; // DEBUG
-
+    return PNG_addLine(pImage, (uint8_t *)pTempLine, y);
 } /* PNG_addRGB565Line() */
 
 //
